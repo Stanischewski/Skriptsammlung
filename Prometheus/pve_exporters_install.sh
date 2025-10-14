@@ -8,7 +8,7 @@
 #
 # Autor: Sebastian Stanischewski
 # Projekt: Netzwerk-Monitoring
-# Datum: 13.10.2025
+# Datum: 14.10.2025 - v1.1 (Verbesserte Fehlerbehandlung)
 ################################################################################
 
 set -e  # Exit bei Fehler
@@ -151,7 +151,7 @@ create_pve_monitoring_user() {
     
     # Prüfe ob User existiert
     if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
-        log_warn "User '${MONITORING_USER}@pve' existiert bereits"
+        log_warn "User '${MONITORING_USER}@pve' existiert bereits - überspringe Erstellung"
     else
         pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User"
         log_info "User '${MONITORING_USER}@pve' erstellt"
@@ -165,20 +165,33 @@ create_pve_monitoring_user() {
         log_warn "Rolle 'PVEMonitoring' existiert bereits"
     fi
     
-    # Weise Rolle zu
+    # Weise Rolle zu (immer ausführen, auch wenn User schon existiert)
     pveum aclmod / -user ${MONITORING_USER}@pve -role PVEMonitoring
     log_info "Rolle 'PVEMonitoring' dem User zugewiesen"
     
     # Erstelle API Token (falls nicht vorhanden)
-    if pveum user token list ${MONITORING_USER}@pve | grep -q "${API_TOKEN_NAME}"; then
+    if pveum user token list ${MONITORING_USER}@pve 2>/dev/null | grep -q "${API_TOKEN_NAME}"; then
         log_warn "API Token '${API_TOKEN_NAME}' existiert bereits"
-        log_warn "Verwende existierenden Token - bitte Token-Value manuell in Config eintragen!"
-        TOKEN_VALUE="EXISTING_TOKEN_PLEASE_CHECK"
+        log_warn ""
+        log_warn "WICHTIG: Bitte trage den existierenden Token manuell in die Config ein:"
+        log_warn "  /etc/pve_exporter/config.yaml"
+        log_warn ""
+        TOKEN_VALUE="EXISTING_TOKEN_BITTE_MANUELL_EINTRAGEN"
     else
-        # Token erstellen und Value extrahieren
-        TOKEN_OUTPUT=$(pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0 --output-format=json)
-        TOKEN_VALUE=$(echo $TOKEN_OUTPUT | grep -oP '(?<="value":")[^"]*')
-        log_info "API Token erstellt: ${TOKEN_VALUE}"
+        # Token erstellen
+        log_info "Erstelle neuen API Token..."
+        TOKEN_OUTPUT=$(pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0 2>&1)
+        
+        # Extrahiere Token Value (funktioniert mit verschiedenen Ausgabeformaten)
+        TOKEN_VALUE=$(echo "$TOKEN_OUTPUT" | grep -oP "([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})" | head -1)
+        
+        if [ -z "$TOKEN_VALUE" ]; then
+            log_error "Konnte Token nicht extrahieren. Ausgabe:"
+            echo "$TOKEN_OUTPUT"
+            TOKEN_VALUE="TOKEN_EXTRACTION_FAILED_BITTE_MANUELL_EINTRAGEN"
+        else
+            log_info "API Token erstellt: ${TOKEN_VALUE}"
+        fi
     fi
     
     # Speichere Token für Config
@@ -194,7 +207,7 @@ create_pve_exporter_config() {
     if [ -f /tmp/pve_exporter_token.txt ]; then
         TOKEN_VALUE=$(cat /tmp/pve_exporter_token.txt)
     else
-        TOKEN_VALUE="BITTE_TOKEN_EINTRAGEN"
+        TOKEN_VALUE="TOKEN_NOT_FOUND_BITTE_MANUELL_EINTRAGEN"
         log_warn "Token-Datei nicht gefunden - bitte Token manuell in Config eintragen!"
     fi
     
@@ -291,10 +304,15 @@ verify_installation() {
         if curl -s http://localhost:${PVE_EXPORTER_PORT}/pve | grep -q "pve_"; then
             log_info "✓ pve_exporter liefert Metriken"
         else
-            log_warn "✗ pve_exporter läuft, aber liefert keine Metriken (Permission-Problem?)"
+            log_warn "✗ pve_exporter läuft, aber liefert keine Metriken"
+            log_warn "  Mögliche Ursachen:"
+            log_warn "  - Token in /etc/pve_exporter/config.yaml falsch/fehlend"
+            log_warn "  - Permissions nicht korrekt"
+            log_warn "  Prüfe: journalctl -u prometheus-pve-exporter -n 20"
         fi
     else
         log_error "✗ pve_exporter läuft NICHT"
+        log_error "  Prüfe: systemctl status prometheus-pve-exporter"
     fi
 }
 
@@ -312,6 +330,25 @@ print_summary() {
     echo "  • node_exporter:  keine Config nötig"
     echo "  • pve_exporter:   /etc/pve_exporter/config.yaml"
     echo ""
+    
+    # Prüfe ob Token manuell eingetragen werden muss
+    if grep -q "BITTE_MANUELL_EINTRAGEN\|NOT_FOUND\|EXTRACTION_FAILED" /etc/pve_exporter/config.yaml 2>/dev/null; then
+        echo -e "${YELLOW}ACHTUNG: Token muss manuell eingetragen werden!${NC}"
+        echo ""
+        echo "1. Zeige existierende Tokens an:"
+        echo "   pveum user token list ${MONITORING_USER}@pve"
+        echo ""
+        echo "2. Falls kein Token existiert, erstelle einen:"
+        echo "   pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0"
+        echo ""
+        echo "3. Trage den Token in die Config ein:"
+        echo "   nano /etc/pve_exporter/config.yaml"
+        echo ""
+        echo "4. Service neu starten:"
+        echo "   systemctl restart prometheus-pve-exporter"
+        echo ""
+    fi
+    
     echo "Service-Verwaltung:"
     echo "  systemctl status node_exporter"
     echo "  systemctl status prometheus-pve-exporter"
@@ -326,13 +363,13 @@ print_summary() {
     echo "    static_configs:"
     echo "      - targets: ['$(get_hostname):${NODE_EXPORTER_PORT}']"
     echo "        labels:"
-    echo "          instance: '$(get_hostname)'"
+    echo "          instance: '$(hostname -s)'"
     echo ""
     echo "  - job_name: 'proxmox-cluster'"
     echo "    static_configs:"
     echo "      - targets: ['$(get_hostname):${PVE_EXPORTER_PORT}']"
     echo "        labels:"
-    echo "          instance: '$(get_hostname)'"
+    echo "          instance: '$(hostname -s)'"
     echo ""
     echo "========================================================================"
 }
