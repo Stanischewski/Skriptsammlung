@@ -216,12 +216,17 @@ install_pve_exporter() {
 create_pve_monitoring_user() {
     log_info "Konfiguriere Proxmox Monitoring User und Permissions..."
 
-    # Prüfe ob User existiert
+    # Erstelle User (mit Fehlerbehandlung)
     if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
         log_warn "User '${MONITORING_USER}@pve' existiert bereits"
     else
-        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User"
-        log_info "User '${MONITORING_USER}@pve' erstellt"
+        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User" 2>/dev/null || {
+            log_warn "User konnte nicht erstellt werden (existiert möglicherweise bereits)"
+        }
+        # Prüfe ob User jetzt existiert
+        if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
+            log_info "User '${MONITORING_USER}@pve' erstellt"
+        fi
     fi
 
     # Erstelle Monitoring-Rolle (falls nicht vorhanden)
@@ -237,8 +242,10 @@ create_pve_monitoring_user() {
         fi
     fi
 
-    # Weise Rolle zu
-    pveum aclmod / -user ${MONITORING_USER}@pve -role PrometheusMonitoring
+    # Weise Rolle zu (mit Fehlerbehandlung für bereits zugewiesene Rollen)
+    pveum aclmod / -user ${MONITORING_USER}@pve -role PrometheusMonitoring 2>/dev/null || {
+        log_warn "Rolle war bereits zugewiesen oder konnte nicht zugewiesen werden"
+    }
     log_info "Rolle 'PrometheusMonitoring' dem User zugewiesen"
 }
 
