@@ -286,11 +286,8 @@ setup_password_auth() {
     # Generiere sicheres Passwort
     USER_PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
 
-    # Setze Passwort für User
-    echo "${MONITORING_USER}@pve:${USER_PASSWORD}" | chpasswd -e 2>/dev/null || {
-        # Fallback für Proxmox (verwendet pveum)
-        pveum user modify ${MONITORING_USER}@pve --password "${USER_PASSWORD}"
-    }
+    # Setze Passwort für User (verwende pveum passwd)
+    echo -e "${USER_PASSWORD}\n${USER_PASSWORD}" | pveum passwd ${MONITORING_USER}@pve
 
     log_info "Passwort für User '${MONITORING_USER}@pve' gesetzt"
 
