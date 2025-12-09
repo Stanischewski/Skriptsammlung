@@ -225,16 +225,16 @@ create_pve_monitoring_user() {
     fi
 
     # Erstelle Monitoring-Rolle (falls nicht vorhanden)
-    if ! pveum role list | grep -q "^PVEMonitoring"; then
-        pveum role add PVEMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit
-        log_info "Rolle 'PVEMonitoring' erstellt"
+    if ! pveum role list | grep -q "^PrometheusMonitoring"; then
+        pveum role add PrometheusMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit
+        log_info "Rolle 'PrometheusMonitoring' erstellt"
     else
-        log_warn "Rolle 'PVEMonitoring' existiert bereits"
+        log_warn "Rolle 'PrometheusMonitoring' existiert bereits"
     fi
 
     # Weise Rolle zu
-    pveum aclmod / -user ${MONITORING_USER}@pve -role PVEMonitoring
-    log_info "Rolle 'PVEMonitoring' dem User zugewiesen"
+    pveum aclmod / -user ${MONITORING_USER}@pve -role PrometheusMonitoring
+    log_info "Rolle 'PrometheusMonitoring' dem User zugewiesen"
 }
 
 setup_token_auth() {
