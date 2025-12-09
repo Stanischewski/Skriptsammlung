@@ -8,17 +8,15 @@
 #
 # Autor: Sebastian Stanischewski
 # Projekt: Netzwerk-Monitoring
-# Datum: 14.10.2025 - v1.2 (Idempotent & Safe)
+# Datum: 13.10.2025
 ################################################################################
 
-# NICHT bei Fehler abbrechen (wir behandeln Fehler manuell)
-set +e
+set -e  # Exit bei Fehler
 
 # Farben für Output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Versionen (anpassbar)
@@ -30,6 +28,7 @@ NODE_EXPORTER_PORT="9100"
 PVE_EXPORTER_PORT="9221"
 MONITORING_USER="pve-exporter"
 API_TOKEN_NAME="exporter"
+AUTH_METHOD=""  # Wird später gesetzt: "token" oder "password"
 
 ################################################################################
 # Funktionen
@@ -47,10 +46,6 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-log_skip() {
-    echo -e "${BLUE}[SKIP]${NC} $1"
-}
-
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "Dieses Script muss als root ausgeführt werden!"
@@ -58,8 +53,74 @@ check_root() {
     fi
 }
 
+check_proxmox_environment() {
+    log_info "Prüfe Proxmox VE Umgebung..."
+
+    # Prüfe ob pveum vorhanden ist
+    if ! command -v pveum &> /dev/null; then
+        log_error "pveum command nicht gefunden!"
+        log_error "Dieses Script muss auf einem Proxmox VE Host ausgeführt werden."
+        log_error "Bitte führen Sie das Script direkt auf dem PVE-Host aus:"
+        log_error "  ssh root@ihr-pve-host.domain"
+        log_error "  bash -c \"\$(curl -s https://raw.githubusercontent.com/...)\""
+        exit 1
+    fi
+
+    # Prüfe ob PVE installiert ist
+    if [ ! -f /etc/pve/datacenter.cfg ]; then
+        log_error "Proxmox VE Konfiguration nicht gefunden!"
+        log_error "Ist Proxmox VE korrekt installiert?"
+        exit 1
+    fi
+
+    log_info "✓ Proxmox VE Umgebung erkannt"
+}
+
 get_hostname() {
     hostname -f
+}
+
+ask_auth_method() {
+    echo ""
+    echo "========================================================================"
+    echo "Authentifizierungsmethode für pve_exporter auswählen"
+    echo "========================================================================"
+    echo ""
+    echo "Es gibt zwei Möglichkeiten zur Authentifizierung:"
+    echo ""
+    echo "1) API Token (empfohlen, sicherer)"
+    echo "   + Keine Passwörter in Konfigurationsdateien"
+    echo "   + Kann bei Bedarf widerrufen werden"
+    echo "   - Erfordert manuelle Token-Eingabe nach Installation"
+    echo ""
+    echo "2) Passwort (einfacher, weniger sicher)"
+    echo "   + Funktioniert sofort nach Installation"
+    echo "   + Keine manuelle Nachbearbeitung nötig"
+    echo "   - Passwort wird in Klartext gespeichert (/etc/pve_exporter/config.yaml)"
+    echo "   - Nur für nicht-kritische Umgebungen empfohlen"
+    echo ""
+    echo "========================================================================"
+    echo ""
+
+    while true; do
+        read -p "Welche Methode möchten Sie verwenden? (1/2): " choice
+        case $choice in
+            1)
+                AUTH_METHOD="token"
+                log_info "✓ API Token-Authentifizierung gewählt"
+                break
+                ;;
+            2)
+                AUTH_METHOD="password"
+                log_info "✓ Passwort-Authentifizierung gewählt"
+                break
+                ;;
+            *)
+                log_error "Ungültige Eingabe. Bitte 1 oder 2 wählen."
+                ;;
+        esac
+    done
+    echo ""
 }
 
 ################################################################################
@@ -67,34 +128,14 @@ get_hostname() {
 ################################################################################
 
 install_node_exporter() {
-    # Prüfe ob node_exporter bereits läuft
-    if systemctl is-active --quiet node_exporter; then
-        log_skip "node_exporter läuft bereits - überspringe Installation"
-        return 0
-    fi
-    
-    # Prüfe ob Binary bereits existiert
-    if [ -f "/usr/local/bin/node_exporter" ]; then
-        log_warn "node_exporter Binary existiert bereits - verwende existierende"
-        return 0
-    fi
-    
     log_info "Installiere node_exporter v${NODE_EXPORTER_VERSION}..."
     
     # Download
     cd /tmp
     wget -q "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
     
-    if [ $? -ne 0 ]; then
-        log_error "Download fehlgeschlagen"
-        return 1
-    fi
-    
     # Extrahieren
     tar xzf "node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
-    
-    # Stoppe Service falls er läuft (für Update)
-    systemctl stop node_exporter 2>/dev/null || true
     
     # Binary installieren
     cp "node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter" /usr/local/bin/
@@ -111,17 +152,11 @@ create_node_exporter_user() {
         log_info "Erstelle node_exporter System-User..."
         useradd --no-create-home --shell /bin/false node_exporter
     else
-        log_skip "User 'node_exporter' existiert bereits"
+        log_warn "User 'node_exporter' existiert bereits"
     fi
 }
 
 create_node_exporter_service() {
-    # Prüfe ob Service-Datei bereits existiert
-    if [ -f "/etc/systemd/system/node_exporter.service" ] && systemctl is-active --quiet node_exporter; then
-        log_skip "node_exporter Service läuft bereits"
-        return 0
-    fi
-    
     log_info "Erstelle node_exporter systemd Service..."
     
     cat > /etc/systemd/system/node_exporter.service <<EOF
@@ -162,121 +197,130 @@ EOF
 install_pve_exporter_dependencies() {
     log_info "Installiere Python3 und pip..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-pip python3-venv 2>&1 | grep -v "^Extracting\|^Selecting\|^Preparing\|^Unpacking\|^Setting up\|^Processing"
+    apt-get install -y -qq python3 python3-pip python3-venv
 }
 
 install_pve_exporter() {
-    # Prüfe ob bereits installiert
-    if [ -f "/opt/prometheus-pve-exporter/bin/pve_exporter" ] && systemctl is-active --quiet prometheus-pve-exporter; then
-        log_skip "pve_exporter läuft bereits - überspringe Installation"
-        return 0
-    fi
-    
     log_info "Installiere pve_exporter v${PVE_EXPORTER_VERSION}..."
     
     # Erstelle Virtual Environment
-    if [ ! -d "/opt/prometheus-pve-exporter" ]; then
-        python3 -m venv /opt/prometheus-pve-exporter
-    fi
+    python3 -m venv /opt/prometheus-pve-exporter
     
     # Installiere pve_exporter
-    /opt/prometheus-pve-exporter/bin/pip install --quiet --upgrade pip 2>/dev/null
-    /opt/prometheus-pve-exporter/bin/pip install --quiet prometheus-pve-exporter==${PVE_EXPORTER_VERSION} 2>/dev/null
+    /opt/prometheus-pve-exporter/bin/pip install --quiet --upgrade pip
+    /opt/prometheus-pve-exporter/bin/pip install --quiet prometheus-pve-exporter==${PVE_EXPORTER_VERSION}
     
     log_info "pve_exporter installiert"
 }
 
 create_pve_monitoring_user() {
     log_info "Konfiguriere Proxmox Monitoring User und Permissions..."
-    
+
     # Prüfe ob User existiert
     if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
-        log_skip "User '${MONITORING_USER}@pve' existiert bereits"
+        log_warn "User '${MONITORING_USER}@pve' existiert bereits"
     else
-        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            log_info "User '${MONITORING_USER}@pve' erstellt"
-        else
-            log_warn "User konnte nicht erstellt werden (existiert vermutlich bereits)"
-        fi
+        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User"
+        log_info "User '${MONITORING_USER}@pve' erstellt"
     fi
-    
+
     # Erstelle Monitoring-Rolle (falls nicht vorhanden)
     if ! pveum role list | grep -q "^PVEMonitoring"; then
-        pveum role add PVEMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit 2>/dev/null
+        pveum role add PVEMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit
         log_info "Rolle 'PVEMonitoring' erstellt"
     else
-        log_skip "Rolle 'PVEMonitoring' existiert bereits"
+        log_warn "Rolle 'PVEMonitoring' existiert bereits"
     fi
-    
-    # Weise Rolle zu (immer ausführen)
-    pveum aclmod / -user ${MONITORING_USER}@pve -role PVEMonitoring 2>/dev/null
-    log_info "Rolle 'PVEMonitoring' zugewiesen"
+
+    # Weise Rolle zu
+    pveum aclmod / -user ${MONITORING_USER}@pve -role PVEMonitoring
+    log_info "Rolle 'PVEMonitoring' dem User zugewiesen"
 }
 
-create_or_get_api_token() {
+setup_token_auth() {
     log_info "Prüfe API Token..."
-    
-    # Prüfe ob Token existiert
+
+    # Erstelle API Token (falls nicht vorhanden)
     if pveum user token list ${MONITORING_USER}@pve 2>/dev/null | grep -q "${API_TOKEN_NAME}"; then
         log_warn "API Token '${API_TOKEN_NAME}' existiert bereits"
-        
-        # Versuche Token aus existierender Config zu lesen
-        if [ -f "/etc/pve_exporter/config.yaml" ]; then
-            EXISTING_TOKEN=$(grep "token_value:" /etc/pve_exporter/config.yaml | awk '{print $2}')
-            if [ ! -z "$EXISTING_TOKEN" ] && [ "$EXISTING_TOKEN" != "EXISTING_TOKEN_BITTE_MANUELL_EINTRAGEN" ]; then
-                log_info "Verwende Token aus existierender Config"
-                echo "$EXISTING_TOKEN" > /tmp/pve_exporter_token.txt
-                return 0
-            fi
+        log_warn "Falls der Token nicht funktioniert, löschen Sie ihn mit:"
+        log_warn "  pveum user token remove ${MONITORING_USER}@pve ${API_TOKEN_NAME}"
+        log_warn "und führen Sie das Script erneut aus."
+        TOKEN_VALUE="EXISTING_TOKEN_BITTE_MANUELL_EINTRAGEN"
+    else
+        log_info "Erstelle neuen API Token..."
+        # Token erstellen - Output-Format für bessere Extraktion
+        TOKEN_OUTPUT=$(pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0 2>&1)
+
+        # Versuche Token aus verschiedenen Output-Formaten zu extrahieren
+        TOKEN_VALUE=$(echo "$TOKEN_OUTPUT" | grep -oP '(?<=value:\s)[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
+
+        if [ -z "$TOKEN_VALUE" ]; then
+            # Alternative: Versuche JSON-Format
+            TOKEN_VALUE=$(echo "$TOKEN_OUTPUT" | grep -oP '(?<="value":")[^"]*')
         fi
-        
-        log_warn ""
-        log_warn "Token existiert, aber Value unbekannt. Optionen:"
-        log_warn "1. Existierenden Token löschen und neu erstellen:"
-        log_warn "   pveum user token remove ${MONITORING_USER}@pve ${API_TOKEN_NAME}"
-        log_warn "   pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0"
-        log_warn ""
-        log_warn "2. Token manuell in Config eintragen:"
-        log_warn "   nano /etc/pve_exporter/config.yaml"
-        log_warn ""
-        
-        echo "EXISTING_TOKEN_BITTE_MANUELL_EINTRAGEN" > /tmp/pve_exporter_token.txt
-        return 0
+
+        if [ -n "$TOKEN_VALUE" ] && [ "$TOKEN_VALUE" != "null" ]; then
+            log_info "API Token erfolgreich erstellt!"
+            echo ""
+            echo "========================================================================"
+            echo -e "${GREEN}WICHTIG: API Token (bitte kopieren):${NC}"
+            echo "$TOKEN_VALUE"
+            echo "========================================================================"
+            echo ""
+        else
+            log_error "Konnte Token nicht extrahieren!"
+            log_warn "Bitte Token manuell erstellen mit:"
+            log_warn "  pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0"
+            TOKEN_VALUE="BITTE_TOKEN_HIER_EINTRAGEN"
+        fi
     fi
-    
-    # Token erstellen
-    log_info "Erstelle neuen API Token..."
-    TOKEN_OUTPUT=$(pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0 2>&1)
-    
-    # Extrahiere Token Value
-    TOKEN_VALUE=$(echo "$TOKEN_OUTPUT" | grep -oP "([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})" | head -1)
-    
-    if [ -z "$TOKEN_VALUE" ]; then
-        log_error "Konnte Token nicht extrahieren!"
-        echo "TOKEN_EXTRACTION_FAILED" > /tmp/pve_exporter_token.txt
-        return 1
-    fi
-    
-    log_info "API Token erstellt: ${TOKEN_VALUE}"
+
+    # Speichere Token für Config
     echo "$TOKEN_VALUE" > /tmp/pve_exporter_token.txt
+}
+
+setup_password_auth() {
+    log_info "Richte Passwort-Authentifizierung ein..."
+
+    # Generiere sicheres Passwort
+    USER_PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
+
+    # Setze Passwort für User
+    echo "${MONITORING_USER}@pve:${USER_PASSWORD}" | chpasswd -e 2>/dev/null || {
+        # Fallback für Proxmox (verwendet pveum)
+        pveum user modify ${MONITORING_USER}@pve --password "${USER_PASSWORD}"
+    }
+
+    log_info "Passwort für User '${MONITORING_USER}@pve' gesetzt"
+
+    # Speichere Passwort für Config
+    echo "$USER_PASSWORD" > /tmp/pve_exporter_password.txt
+
+    echo ""
+    echo "========================================================================"
+    echo -e "${GREEN}Generiertes Passwort für ${MONITORING_USER}@pve:${NC}"
+    echo "$USER_PASSWORD"
+    echo ""
+    echo "Das Passwort wird automatisch in die Config eingetragen."
+    echo "========================================================================"
+    echo ""
 }
 
 create_pve_exporter_config() {
     log_info "Erstelle pve_exporter Konfiguration..."
-    
+
     mkdir -p /etc/pve_exporter
-    
-    # Lese Token
-    if [ -f /tmp/pve_exporter_token.txt ]; then
-        TOKEN_VALUE=$(cat /tmp/pve_exporter_token.txt)
-    else
-        TOKEN_VALUE="TOKEN_NOT_FOUND_BITTE_MANUELL_EINTRAGEN"
-        log_warn "Token-Datei nicht gefunden"
-    fi
-    
-    # Erstelle Config nur wenn sie nicht existiert oder Token fehlt
-    if [ ! -f "/etc/pve_exporter/config.yaml" ] || grep -q "BITTE_MANUELL_EINTRAGEN\|NOT_FOUND\|EXTRACTION_FAILED" /etc/pve_exporter/config.yaml 2>/dev/null; then
+
+    if [ "$AUTH_METHOD" = "token" ]; then
+        # Token-basierte Konfiguration
+        if [ -f /tmp/pve_exporter_token.txt ]; then
+            TOKEN_VALUE=$(cat /tmp/pve_exporter_token.txt)
+        else
+            TOKEN_VALUE="BITTE_TOKEN_EINTRAGEN"
+            log_warn "Token-Datei nicht gefunden - bitte Token manuell in Config eintragen!"
+        fi
+
         cat > /etc/pve_exporter/config.yaml <<EOF
 default:
   user: ${MONITORING_USER}@pve
@@ -284,26 +328,37 @@ default:
   token_value: ${TOKEN_VALUE}
   verify_ssl: false
 EOF
-        
-        chmod 600 /etc/pve_exporter/config.yaml
-        chown root:root /etc/pve_exporter/config.yaml
-        
-        log_info "Config erstellt: /etc/pve_exporter/config.yaml"
+
+        # Cleanup
+        rm -f /tmp/pve_exporter_token.txt
+
     else
-        log_skip "Config existiert bereits: /etc/pve_exporter/config.yaml"
+        # Passwort-basierte Konfiguration
+        if [ -f /tmp/pve_exporter_password.txt ]; then
+            USER_PASSWORD=$(cat /tmp/pve_exporter_password.txt)
+        else
+            USER_PASSWORD="BITTE_PASSWORT_EINTRAGEN"
+            log_warn "Passwort-Datei nicht gefunden - bitte Passwort manuell in Config eintragen!"
+        fi
+
+        cat > /etc/pve_exporter/config.yaml <<EOF
+default:
+  user: ${MONITORING_USER}@pve
+  password: ${USER_PASSWORD}
+  verify_ssl: false
+EOF
+
+        # Cleanup
+        rm -f /tmp/pve_exporter_password.txt
     fi
-    
-    # Cleanup
-    rm -f /tmp/pve_exporter_token.txt
+
+    chmod 600 /etc/pve_exporter/config.yaml
+    chown root:root /etc/pve_exporter/config.yaml
+
+    log_info "Config erstellt: /etc/pve_exporter/config.yaml"
 }
 
 create_pve_exporter_service() {
-    # Prüfe ob Service läuft
-    if [ -f "/etc/systemd/system/prometheus-pve-exporter.service" ] && systemctl is-active --quiet prometheus-pve-exporter; then
-        log_skip "pve_exporter Service läuft bereits"
-        return 0
-    fi
-    
     log_info "Erstelle pve_exporter systemd Service..."
     
     cat > /etc/systemd/system/prometheus-pve-exporter.service <<EOF
@@ -329,10 +384,27 @@ WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable prometheus-pve-exporter 2>/dev/null
-    systemctl restart prometheus-pve-exporter
+    systemctl enable prometheus-pve-exporter
+    systemctl start prometheus-pve-exporter
     
     log_info "pve_exporter Service gestartet"
+}
+
+################################################################################
+# Firewall-Konfiguration (optional)
+################################################################################
+
+configure_firewall() {
+    log_info "Konfiguriere Firewall-Regeln..."
+    
+    # Prüfe ob pve-firewall aktiv ist
+    if systemctl is-active --quiet pve-firewall; then
+        log_warn "Proxmox Firewall aktiv - bitte Regeln manuell in Web-UI hinzufügen:"
+        log_warn "  - Port ${NODE_EXPORTER_PORT}/tcp (node_exporter)"
+        log_warn "  - Port ${PVE_EXPORTER_PORT}/tcp (pve_exporter)"
+    else
+        log_info "Proxmox Firewall nicht aktiv - keine Firewall-Konfiguration nötig"
+    fi
 }
 
 ################################################################################
@@ -341,30 +413,33 @@ EOF
 
 verify_installation() {
     log_info "Verifiziere Installation..."
-    
-    sleep 3
-    
-    echo ""
-    
+
+    sleep 3  # Warte auf Service-Start
+
     # node_exporter
     if systemctl is-active --quiet node_exporter; then
+        log_info "✓ node_exporter läuft"
         if curl -s http://localhost:${NODE_EXPORTER_PORT}/metrics | grep -q "node_exporter"; then
-            log_info "✓ node_exporter läuft und liefert Metriken"
+            log_info "✓ node_exporter liefert Metriken"
         else
-            log_warn "✗ node_exporter läuft, aber keine Metriken"
+            log_error "✗ node_exporter liefert keine Metriken"
         fi
     else
         log_error "✗ node_exporter läuft NICHT"
     fi
-    
+
     # pve_exporter
     if systemctl is-active --quiet prometheus-pve-exporter; then
-        if curl -s http://localhost:${PVE_EXPORTER_PORT}/pve 2>/dev/null | grep -q "pve_"; then
-            log_info "✓ pve_exporter läuft und liefert Metriken"
+        log_info "✓ pve_exporter läuft"
+        if curl -s http://localhost:${PVE_EXPORTER_PORT}/pve | grep -q "pve_"; then
+            log_info "✓ pve_exporter liefert Metriken"
         else
             log_warn "✗ pve_exporter läuft, aber keine Metriken"
-            log_warn "  Prüfe Token in: /etc/pve_exporter/config.yaml"
-            log_warn "  Logs: journalctl -u prometheus-pve-exporter -n 20"
+            if [ "$AUTH_METHOD" = "token" ]; then
+                log_warn "  Prüfe Token in: /etc/pve_exporter/config.yaml"
+            else
+                log_warn "  Prüfe Logs: journalctl -u prometheus-pve-exporter -n 20"
+            fi
         fi
     else
         log_error "✗ pve_exporter läuft NICHT"
@@ -384,44 +459,54 @@ print_summary() {
     echo "Konfiguration:"
     echo "  • node_exporter:  keine Config nötig"
     echo "  • pve_exporter:   /etc/pve_exporter/config.yaml"
-    echo ""
-    
-    # Prüfe ob Token manuell eingetragen werden muss
-    if [ -f "/etc/pve_exporter/config.yaml" ] && grep -q "BITTE_MANUELL_EINTRAGEN\|NOT_FOUND\|EXTRACTION_FAILED" /etc/pve_exporter/config.yaml 2>/dev/null; then
-        echo -e "${YELLOW}⚠ ACHTUNG: Token muss manuell eingetragen werden!${NC}"
+
+    if [ "$AUTH_METHOD" = "token" ]; then
         echo ""
-        echo "Schritte:"
-        echo "1. Lösche alten Token und erstelle neuen:"
-        echo "   pveum user token remove ${MONITORING_USER}@pve ${API_TOKEN_NAME}"
-        echo "   pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0"
+        echo "Authentifizierung: API Token"
         echo ""
-        echo "2. Kopiere den angezeigten Token-Value"
+        echo -e "${YELLOW}⚠ WICHTIG:${NC} Wenn der Token nicht automatisch eingetragen wurde:"
+        echo "  1. Erstellen Sie einen neuen Token:"
+        echo "     pveum user token add ${MONITORING_USER}@pve ${API_TOKEN_NAME} --privsep 0"
         echo ""
-        echo "3. Trage ihn in die Config ein:"
-        echo "   nano /etc/pve_exporter/config.yaml"
+        echo "  2. Kopieren Sie den angezeigten Token-Value"
         echo ""
-        echo "4. Service neu starten:"
-        echo "   systemctl restart prometheus-pve-exporter"
+        echo "  3. Tragen Sie ihn in die Config ein:"
+        echo "     nano /etc/pve_exporter/config.yaml"
         echo ""
+        echo "  4. Service neu starten:"
+        echo "     systemctl restart prometheus-pve-exporter"
+    else
+        echo ""
+        echo "Authentifizierung: Passwort (automatisch konfiguriert)"
+        echo -e "${GREEN}✓${NC} pve_exporter ist sofort einsatzbereit!"
+        echo ""
+        echo -e "${YELLOW}Sicherheitshinweis:${NC}"
+        echo "  Das Passwort ist in /etc/pve_exporter/config.yaml gespeichert."
+        echo "  Für produktive Umgebungen wird API Token-Authentifizierung empfohlen."
     fi
-    
-    echo "Service-Status:"
+
+    echo ""
+    echo "Service-Status prüfen:"
     echo "  systemctl status node_exporter"
     echo "  systemctl status prometheus-pve-exporter"
     echo ""
-    echo "Logs:"
+    echo "Logs anzeigen:"
     echo "  journalctl -u node_exporter -f"
     echo "  journalctl -u prometheus-pve-exporter -f"
     echo ""
-    echo "Prometheus Scrape-Config:"
+    echo "Prometheus Scrape-Konfiguration hinzufügen:"
     echo ""
     echo "  - job_name: 'proxmox-nodes'"
     echo "    static_configs:"
     echo "      - targets: ['$(get_hostname):${NODE_EXPORTER_PORT}']"
+    echo "        labels:"
+    echo "          instance: '$(get_hostname)'"
     echo ""
     echo "  - job_name: 'proxmox-cluster'"
     echo "    static_configs:"
     echo "      - targets: ['$(get_hostname):${PVE_EXPORTER_PORT}']"
+    echo "        labels:"
+    echo "          instance: '$(get_hostname)'"
     echo ""
     echo "========================================================================"
 }
@@ -432,34 +517,71 @@ print_summary() {
 
 main() {
     echo "========================================================================"
-    echo "Prometheus Exporters Installation für Proxmox VE v1.2"
+    echo "Prometheus Exporters Installation für Proxmox VE v1.3"
     echo "Host: $(get_hostname)"
     echo "========================================================================"
     echo ""
-    
+
     check_root
-    
+    check_proxmox_environment
+
+    # Authentifizierungsmethode wählen
+    ask_auth_method
+
     # node_exporter
     log_info "=== node_exporter Installation ==="
     create_node_exporter_user
-    install_node_exporter
-    create_node_exporter_service
+
+    # Prüfe ob node_exporter bereits läuft
+    if systemctl is-active --quiet node_exporter; then
+        log_warn "node_exporter läuft bereits - überspringe Installation"
+    else
+        install_node_exporter
+        create_node_exporter_service
+    fi
     echo ""
-    
+
     # pve_exporter
     log_info "=== pve_exporter Installation ==="
     install_pve_exporter_dependencies
-    install_pve_exporter
+
+    # Prüfe ob pve_exporter bereits läuft
+    if systemctl is-active --quiet prometheus-pve-exporter; then
+        log_warn "pve_exporter läuft bereits - überspringe Installation"
+        log_warn "Um die Authentifizierung zu ändern, stoppen Sie den Service:"
+        log_warn "  systemctl stop prometheus-pve-exporter"
+    else
+        install_pve_exporter
+    fi
+
     create_pve_monitoring_user
-    create_or_get_api_token
+
+    # Authentifizierung einrichten (basierend auf Auswahl)
+    if [ "$AUTH_METHOD" = "token" ]; then
+        setup_token_auth
+    else
+        setup_password_auth
+    fi
+
     create_pve_exporter_config
-    create_pve_exporter_service
+
+    # Service nur starten wenn noch nicht aktiv
+    if ! systemctl is-active --quiet prometheus-pve-exporter; then
+        create_pve_exporter_service
+    else
+        log_info "Starte pve_exporter Service neu mit neuer Konfiguration..."
+        systemctl restart prometheus-pve-exporter
+    fi
     echo ""
-    
+
+    # Firewall
+    configure_firewall
+    echo ""
+
     # Verifikation
     verify_installation
     echo ""
-    
+
     # Summary
     print_summary
 }
