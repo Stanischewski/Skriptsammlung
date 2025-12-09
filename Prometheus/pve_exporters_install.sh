@@ -216,16 +216,19 @@ install_pve_exporter() {
 create_pve_monitoring_user() {
     log_info "Konfiguriere Proxmox Monitoring User und Permissions..."
 
-    # Erstelle User (mit Fehlerbehandlung)
+    # Erstelle User (mit Fehlerbehandlung - deaktiviere set -e temporär)
     if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
         log_warn "User '${MONITORING_USER}@pve' existiert bereits"
     else
-        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User" 2>/dev/null || {
-            log_warn "User konnte nicht erstellt werden (existiert möglicherweise bereits)"
-        }
-        # Prüfe ob User jetzt existiert
-        if pveum user list | grep -q "^${MONITORING_USER}@pve"; then
+        set +e  # Deaktiviere exit on error
+        pveum user add ${MONITORING_USER}@pve --comment "Prometheus Monitoring User" 2>/dev/null
+        USER_CREATE_RESULT=$?
+        set -e  # Reaktiviere exit on error
+
+        if [ $USER_CREATE_RESULT -eq 0 ]; then
             log_info "User '${MONITORING_USER}@pve' erstellt"
+        else
+            log_warn "User konnte nicht erstellt werden (existiert möglicherweise bereits)"
         fi
     fi
 
@@ -233,20 +236,29 @@ create_pve_monitoring_user() {
     if pveum role list | grep -q "^PrometheusMonitoring"; then
         log_warn "Rolle 'PrometheusMonitoring' existiert bereits"
     else
-        pveum role add PrometheusMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit 2>/dev/null || {
-            log_warn "Rolle konnte nicht erstellt werden (existiert möglicherweise bereits)"
-        }
-        # Prüfe ob Rolle jetzt existiert
-        if pveum role list | grep -q "^PrometheusMonitoring"; then
+        set +e  # Deaktiviere exit on error
+        pveum role add PrometheusMonitoring -privs VM.Audit,Sys.Audit,Datastore.Audit,SDN.Audit 2>/dev/null
+        ROLE_CREATE_RESULT=$?
+        set -e  # Reaktiviere exit on error
+
+        if [ $ROLE_CREATE_RESULT -eq 0 ]; then
             log_info "Rolle 'PrometheusMonitoring' erstellt"
+        else
+            log_warn "Rolle konnte nicht erstellt werden (existiert möglicherweise bereits)"
         fi
     fi
 
     # Weise Rolle zu (mit Fehlerbehandlung für bereits zugewiesene Rollen)
-    pveum aclmod / -user ${MONITORING_USER}@pve -role PrometheusMonitoring 2>/dev/null || {
-        log_warn "Rolle war bereits zugewiesen oder konnte nicht zugewiesen werden"
-    }
-    log_info "Rolle 'PrometheusMonitoring' dem User zugewiesen"
+    set +e  # Deaktiviere exit on error
+    pveum aclmod / -user ${MONITORING_USER}@pve -role PrometheusMonitoring 2>/dev/null
+    ACL_RESULT=$?
+    set -e  # Reaktiviere exit on error
+
+    if [ $ACL_RESULT -eq 0 ]; then
+        log_info "Rolle 'PrometheusMonitoring' dem User zugewiesen"
+    else
+        log_warn "Rolle war bereits zugewiesen"
+    fi
 }
 
 setup_token_auth() {
